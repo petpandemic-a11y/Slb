@@ -1,8 +1,9 @@
-// Raydium LP burn watcher (Helius WS - nem enhanced, kreditkímélő)
+// Raydium LP burn watcher (Helius WS - nem enhanced, kreditkímélő + MIN_SOL_BURN szűrő)
 // WS: logsSubscribe Raydium AMM v4 + CPMM -> signature + LOGS
 //   -> csak akkor kérünk le tx-t, ha a LOG-okban tényleg "Instruction: Burn" van
 // HTTP RPC: getTransaction(jsonParsed) -> inner Tokenkeg: Burn
 // Jelzés: ha a Burn mint szerepel bármely Raydium-instrukció accounts közt (LP mint match)
+// ÚJ: MIN_SOL_BURN (SOL) küszöb – ha a becsült kivett SOL ez alatti, NEM küld üzenetet.
 
 import WebSocket from "ws";
 import http from "http";
@@ -18,10 +19,14 @@ const RPC_WSS  = process.env.RPC_WSS  || "wss://api.mainnet-beta.solana.com";
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 
+// MIN SOL küszöb (pl. 0.5) – 0 vagy hiányzik: nincs szűrés
+const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
+
 // Program IDs
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const RAY_CPMM   = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const WSOL_MINT  = "So11111111111111111111111111111111111111112";
 
 // ==== logger ====
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -64,6 +69,28 @@ async function getTransaction(signature, tries = 3) {
       }
     }
   }
+}
+
+// ---- Parsed account info (cache-elve), kell a WSOL-vault és LP supply-hoz ----
+async function getParsedAccountInfo(pubkey) {
+  return rpc("getParsedAccountInfo", [pubkey, { commitment: "confirmed" }]);
+}
+const parsedCache = new Map();
+async function getParsedCached(pubkey) {
+  if (parsedCache.has(pubkey)) return parsedCache.get(pubkey);
+  try {
+    const info = await getParsedAccountInfo(pubkey);
+    parsedCache.set(pubkey, info);
+    return info;
+  } catch {
+    parsedCache.set(pubkey, null);
+    return null;
+  }
+}
+async function tokenAccountInfo(pubkey) {
+  const info = await getParsedCached(pubkey);
+  const d = info?.value?.data?.parsed;
+  return d?.type === "account" ? d?.info : null;
 }
 
 // ==== Telegram (queue + throttle) ====
@@ -159,14 +186,54 @@ async function processSignature(sig) {
     if (!mint) continue;
     if (!rayAccounts.has(mint)) continue; // nem Raydium LP mint
 
-    const amount = ix?.parsed?.info?.amount || ix?.amount;
+    // ---- ÚJ: MIN_SOL_BURN küszöb (becsült SOL kivét) ----
+    // LP supply (post-burn) + LP decimals
+    let supplyPostRaw = 0;
+    let lpDecimals = 0;
+    try {
+      const info = await getParsedCached(mint);
+      const m = info?.value?.data?.parsed?.info;
+      if (m?.supply) supplyPostRaw = Number(m.supply);
+      if (m?.decimals != null) lpDecimals = Number(m.decimals) || 0;
+    } catch {}
+
+    const burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
+    const supplyPreRaw = supplyPostRaw + burnAmountRaw;
+    const share = supplyPreRaw > 0 ? burnAmountRaw / supplyPreRaw : 0;
+
+    // WSOL-vault SOL mennyisége a Raydium acc-ok között (parsed token account)
+    let wsolVaultAmountRaw = 0;
+    let wsolDecimals = 9;
+    const MAX_CHECK = 25;
+    let checked = 0;
+    for (const a of rayAccounts) {
+      if (checked >= MAX_CHECK) break;
+      checked++;
+      const acc = await tokenAccountInfo(a);
+      if (!acc) continue;
+      if (acc?.mint === WSOL_MINT) {
+        const ta = acc?.tokenAmount;
+        if (ta?.amount) wsolVaultAmountRaw = Number(ta.amount);
+        if (ta?.decimals != null) wsolDecimals = Number(ta.decimals) || 9;
+        break;
+      }
+    }
+    const wsolVaultSOL = wsolVaultAmountRaw / Math.pow(10, wsolDecimals);
+    const estSolOut = share * wsolVaultSOL;
+
+    if (MIN_SOL_BURN > 0 && estSolOut < MIN_SOL_BURN) {
+      log(`skip (est SOL ${estSolOut.toFixed(4)} < min ${MIN_SOL_BURN}) sig=${sig}`);
+      return; // küszöb alatt: nincs üzenet
+    }
+
+    // ---- Üzenet (eredeti, egyszerű) ----
     const when = tx?.blockTime ? new Date(tx.blockTime * 1000).toISOString() : "";
     const link = `https://solscan.io/tx/${sig}`;
-
     const msg = [
       "🔥 <b>Raydium LP BURN</b>",
       `Mint: <code>${mint}</code>`,
-      amount ? `Amount: ${amount}` : null,
+      `Amount: ${burnAmountRaw}`,
+      `Est. SOL from LP: ${estSolOut.toFixed(4)} SOL`,
       when ? `Time: ${when}` : null,
       `Sig: <a href="${link}">${sig}</a>`
     ]
