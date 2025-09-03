@@ -4,6 +4,7 @@
 // LP-burn jelzés akkor, ha a Burn mint szerepel a Raydium-instrukciók accountjai között
 // Opcionális Telegram értesítés (throttled)
 
+import WebSocket from "ws";
 import http from "http";
 
 // ---- ENV ----
