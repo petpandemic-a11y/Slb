@@ -1,6 +1,6 @@
 // Raydium LP burn watcher → TG (Dexs + on-chain)
 // WS (nem enhanced): "Instruction: Burn" előszűrés
-// 1 tx/s limit (írj át 2000-re ha 2 mp-enként akarod), TG throttle, MIN_SOL_BURN küszöb
+// Rate limit: RATE_MS (default 1000ms). TG throttle, MIN_SOL_BURN küszöb
 // Base/Quote: (1) balance-diff → (2) pool state RAW scan → (3) largest vaults → (4) freq fallback
 
 import WebSocket from "ws";
@@ -14,7 +14,7 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
 const DEBUG = process.env.DEBUG === "1";
-const RATE_MS = Number(process.env.RATE_MS || 1000); // írd át 2000-re ha 2s kell
+const RATE_MS = Number(process.env.RATE_MS || 1000); // állítsd 2000-re ha 2 mp/tx
 
 // ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -58,7 +58,6 @@ async function getTransaction(signature, tries=3){
 }
 async function getParsedAccountInfo(pubkey){ return rpc("getParsedAccountInfo",[pubkey,{commitment:"confirmed"}]); }
 async function getAccountInfoRaw(pubkey){ return rpc("getAccountInfo",[pubkey,{commitment:"confirmed",encoding:"base64"}]); }
-async function getTokenLargestAccounts(mint){ return rpc("getTokenLargestAccounts",[mint,{commitment:"confirmed"}]); }
 async function getProgramAccounts(programId, filters=[]) {
   return rpc("getProgramAccounts", [ programId, { commitment:"confirmed", encoding:"base64", filters } ]);
 }
@@ -103,7 +102,8 @@ async function fetchDexscreenerByToken(mint){
       liq:    p?.liquidity?.usd ? Number(p.liquidity.usd) : null,
       fdv:    p?.fdv ? Number(p.fdv) : null,
       mcap:   p?.marketCap ? Number(p.marketCap) : null,
-      url:    p?.url || null
+      url:    p?.url || null,
+      createdAt: p?.pairCreatedAt || null
     };
     dbg("dexs ok:", out);
     return out;
@@ -191,7 +191,7 @@ async function enqueueSignature(sig){
     while (sigQueue.length){
       const s = sigQueue.shift();
       try{ await processSignature(s); }catch(e){ log("processSignature err:", e.message); }
-      await new Promise(r=>setTimeout(r, RATE_MS)); // ← állítsd 2000-re ha 2 mp
+      await new Promise(r=>setTimeout(r, RATE_MS));
     }
     workerRunning=false;
   }
@@ -418,94 +418,63 @@ async function processSignature(sig){
   const { baseMint, quoteMint, source } = res;
   dbg("mint resolution:", { baseMint, quoteMint, source });
 
-  // --- Base token on-chain + Metaplex ---
-  let totalSupply=0, baseDecimals=0, mintAuthNone=null, freezeNone=null;
-  let metaName=null, metaSymbol=null, metaMutable=null;
+  // --- Base token meta + security ---
+  let mintAuthNone=null, freezeNone=null, metaName=null, metaSymbol=null, metaMutable=null;
   if (baseMint){
     try{
       const mi = await getParsedCached(baseMint);
       const info = mi?.value?.data?.parsed?.info;
-      totalSupply = info?.supply ? Number(info.supply) : 0;
-      baseDecimals = info?.decimals!=null ? Number(info.decimals) : 0;
       mintAuthNone = (info?.mintAuthority===null || info?.mintAuthority===undefined);
       freezeNone   = (info?.freezeAuthority===null || info?.freezeAuthority===undefined);
     }catch{}
     const md = await fetchMetaplexMetadata(baseMint);
     if (md){ metaName = md.name || null; metaSymbol = md.symbol || null; metaMutable = md.isMutable; }
   }
-  const totalSupplyUi = baseDecimals ? (totalSupply/10**baseDecimals) : (totalSupply||0);
 
-  // Holders
-  let holdersLines=[];
-  if (baseMint){
-    try{
-      const largest = await getTokenLargestAccounts(baseMint);
-      const arr = Array.isArray(largest?.value) ? largest.value.slice(0,5) : [];
-      holdersLines = arr.map(x=>{
-        const addr = x?.address || "";
-        const amt  = Number(x?.amount || 0);
-        const pct  = totalSupply>0 ? (amt/totalSupply*100) : 0;
-        const short = addr ? `${addr.slice(0,4)}…${addr.slice(-4)}` : "–";
-        return `├ ${short} | ${amt.toLocaleString()} | ${pct.toFixed(2)}%`;
-      });
-    }catch(e){ dbg("holders err:", e.message); }
-  }
-
-  // Dexscreener
+  // Dexscreener (név/ár/mcap/liq + url)
   let dx=null; if (baseMint) dx = await fetchDexscreenerByToken(baseMint);
 
   // --- Üzenet ---
   const when = tx?.blockTime ? new Date(tx.blockTime * 1000).toISOString() : "";
   const link = `https://solscan.io/tx/${sig}`;
   const burnPct = (burnShare*100).toFixed(2);
+  const burnAgo = tx?.blockTime ? ago(tx.blockTime*1000) : "n/a";
 
-  if (dx){
-    const headTitle = (dx.name && dx.symbol) ? `${dx.name} (${dx.symbol})` : "Raydium LP Burn";
-    const mcapStr = dx.mcap!=null ? `$${dx.mcap.toLocaleString()}` : (dx.fdv!=null?`$${dx.fdv.toLocaleString()}`:"n/a");
-    const liqStr  = dx.liq!=null  ? `$${dx.liq.toLocaleString()}` : "n/a";
-    const priceStr= dx.price!=null? `$${dx.price}` : "n/a";
+  // Megjelenítendő cím (name + symbol ha van, különben "Raydium LP Burn")
+  const headTitle = (dx?.name && dx?.symbol) ? `${dx.name} (${dx.symbol})` : "Raydium LP Burn";
 
-    const lines = [
-      `Solana LP Burns`,
-      `<b>${headTitle}</b>`,
-      "",
-      `🔥 <b>Burn Percentage:</b> ${burnPct}%`,
-      when ? `🕒 <b>Trading Start Time:</b> ${ago(tx.blockTime*1000)}` : `🕒 <b>Trading Start Time:</b> n/a`,
-      "",
-      `📊 <b>Marketcap:</b> ${mcapStr}`,
-      `💧 <b>Liquidity:</b> ${liqStr}`,
-      `💲 <b>Price:</b> ${priceStr}`,
-      "",
-      baseMint ? `🧾 <b>Base Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Base Mint:</b> n/a`,
-      `📜 <b>LP Mint:</b> <code>${lpMint}</code>`,
-      "",
-      `⚙️ <b>Security:</b>`,
-      `├ Mutable Metadata: ${metaMutable===null ? "n/a" : (metaMutable ? "Yes ❌" : "No ✅")}`,
-      `├ Mint Authority: ${mintAuthNone===null ? "n/a" : (mintAuthNone ? "No ✅" : "Yes ❌")}`,
-      `└ Freeze Authority: ${freezeNone===null ? "n/a" : (freezeNone ? "No ✅" : "Yes ❌")}`,
-      "",
-      `👥 <b>Top Holders:</b>`,
-      ...(holdersLines.length ? holdersLines : ["├ n/a"]),
-      "",
-      dx.url ? dx.url : null,
-      `🔗 <a href="${link}">Solscan</a>`,
-      DEBUG ? `\n<code>mint_source=${source}</code>` : null
-    ].filter(Boolean);
-    await sendTelegram(lines.join("\n"));
-    log(`TG card (Dexs) → ${headTitle} | burn=${burnPct}% | sig=${sig}`);
-  } else {
-    const msg = [
-      "🔥 <b>Raydium LP BURN</b>",
-      `Mint: <code>${lpMint}</code>`,
-      `Amount: ${burnAmountRaw}`,
-      `Est. SOL from LP: ${estSolOut.toFixed(4)} SOL`,
-      when ? `Time: ${when}` : null,
-      `Sig: <a href="${link}">${sig}</a>`,
-      DEBUG && baseMint ? `\n<code>mint_source=${source} base=${baseMint}</code>` : null
-    ].filter(Boolean).join("\n");
-    await sendTelegram(msg);
-    log(`TG simple → burn=${burnPct}% | sig=${sig}`);
-  }
+  // Pénzügyi mezők
+  const mcapStr = dx?.mcap!=null ? `$${dx.mcap.toLocaleString()}` : (dx?.fdv!=null?`$${dx.fdv.toLocaleString()}`:"n/a");
+  const liqStr  = dx?.liq!=null  ? `$${dx.liq.toLocaleString()}` : "n/a";
+  const priceStr= dx?.price!=null? `$${dx.price}` : "n/a";
+
+  const tokenMintLine = baseMint ? `🧾 <b>Token Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Token Mint:</b> n/a`;
+
+  const lines = [
+    `Solana LP Burns`,
+    `<b>${headTitle}</b>`,
+    "",
+    `🔥 <b>Burn Percentage:</b> ${burnPct}%`,
+    `🕒 <b>Burn Time:</b> ${burnAgo}`,
+    "",
+    `📊 <b>Marketcap:</b> ${mcapStr}`,
+    `💧 <b>Liquidity:</b> ${liqStr}`,
+    `💲 <b>Price:</b> ${priceStr}`,
+    "",
+    tokenMintLine,
+    "",
+    `⚙️ <b>Security:</b>`,
+    `├ Mutable Metadata: ${metaMutable===null ? "n/a" : (metaMutable ? "Yes ❌" : "No ✅")}`,
+    `├ Mint Authority: ${mintAuthNone===null ? "n/a" : (mintAuthNone ? "No ✅" : "Yes ❌")}`,
+    `└ Freeze Authority: ${freezeNone===null ? "n/a" : (freezeNone ? "No ✅" : "Yes ❌")}`,
+    "",
+    dx?.url ? dx.url : null,
+    `🔗 <a href="${link}">Solscan</a>`,
+    DEBUG ? `\n<code>mint_source=${source}</code>` : null
+  ].filter(Boolean);
+
+  await sendTelegram(lines.join("\n"));
+  log(`TG card → ${headTitle} | burn=${burnPct}% | sig=${sig}`);
 }
 
 // ===== WebSocket =====
