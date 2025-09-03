@@ -1,8 +1,7 @@
 // Raydium LP burn watcher → TG (Dexs + on-chain)
 // WS (nem enhanced): "Instruction: Burn" előszűrés
-// 1 tx/s limit, TG throttle, MIN_SOL_BURN küszöb
-// Base/Quote: (1) pool state RAW scan → (2) largest vaults → (3) freq fallback
-// DEBUG=1 env bekapcsolja a részletes logolást
+// 1 tx/s limit (írj át 2000-re ha 2 mp-enként akarod), TG throttle, MIN_SOL_BURN küszöb
+// Base/Quote: (1) balance-diff → (2) pool state RAW scan → (3) largest vaults → (4) freq fallback
 
 import WebSocket from "ws";
 import http from "http";
@@ -15,6 +14,7 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
 const DEBUG = process.env.DEBUG === "1";
+const RATE_MS = Number(process.env.RATE_MS || 1000); // írd át 2000-re ha 2s kell
 
 // ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -110,7 +110,7 @@ async function fetchDexscreenerByToken(mint){
   }catch(e){ dbg("dexs err:", e.message); return null; }
 }
 
-// ===== Metaplex metadata (name, symbol, isMutable) =====
+// ===== Metaplex metadata =====
 async function fetchMetaplexMetadata(mint) {
   try {
     const accs = await getProgramAccounts(METAPLEX_META, [{ memcmp: { offset: 1 + 32, bytes: mint } }]);
@@ -191,7 +191,7 @@ async function enqueueSignature(sig){
     while (sigQueue.length){
       const s = sigQueue.shift();
       try{ await processSignature(s); }catch(e){ log("processSignature err:", e.message); }
-      await new Promise(r=>setTimeout(r,1000));
+      await new Promise(r=>setTimeout(r, RATE_MS)); // ← állítsd 2000-re ha 2 mp
     }
     workerRunning=false;
   }
@@ -206,7 +206,45 @@ function ago(tsMs){
   const d = Math.floor(h/24); return `${d} days ago`;
 }
 
-// ===== Mints a pool state RAW accountból =====
+// ===== 1) Mints a balance-diffből =====
+function resolveMintsByBalanceDiff(tx, lpMint) {
+  const pre = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+  const post = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+
+  const key = (b) => `${b?.accountIndex || 0}|${b?.mint || ""}`;
+  const preMap = new Map(pre.map(b => [key(b), b]));
+  const changes = [];
+
+  for (const b of post) {
+    const k = key(b);
+    const p = preMap.get(k);
+    const mint = b?.mint;
+    if (!mint || mint === lpMint) continue;
+
+    const dec = Number(b?.uiTokenAmount?.decimals || 0);
+    const postAmt = Number(b?.uiTokenAmount?.amount || 0);
+    const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+    const diffRaw = postAmt - preAmt;
+    const diffAbs = Math.abs(diffRaw) / (10 ** dec);
+
+    if (diffAbs > 0) changes.push({ mint, diffAbs });
+  }
+
+  const byMint = new Map();
+  for (const c of changes) byMint.set(c.mint, (byMint.get(c.mint) || 0) + c.diffAbs);
+  const ranked = [...byMint.entries()].sort((a,b)=>b[1]-a[1]);
+  dbg("balDiff ranked:", ranked.slice(0,4));
+
+  if (ranked.length >= 2) {
+    const [m1, m2] = ranked.slice(0,2).map(x=>x[0]);
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint: m2, quoteMint: m1, source: "baldiff" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint: m1, quoteMint: m2, source: "baldiff" };
+    return { baseMint: m1, quoteMint: m2, source: "baldiff" };
+  }
+  return { baseMint: null, quoteMint: null, source: "baldiff-none" };
+}
+
+// ===== 2) Mints a pool state RAW accountból =====
 async function resolveMintsFromState(rayAccounts, lpMint) {
   const stateCandidates = [];
   for (const acc of rayAccounts) {
@@ -247,7 +285,7 @@ async function resolveMintsFromState(rayAccounts, lpMint) {
   return { baseMint:null, quoteMint:null, source:"state-none" };
 }
 
-// ===== ÚJ: Largest vaults stratégia =====
+// ===== 3) Largest vaults =====
 async function resolveMintsByLargestVaults(rayAccounts, lpMint){
   const vaults = [];
   let checked = 0;
@@ -258,8 +296,7 @@ async function resolveMintsByLargestVaults(rayAccounts, lpMint){
     const mint = ta?.mint;
     if (!mint || mint === lpMint) continue;
     const amt = Number(ta?.tokenAmount?.amount || 0);
-    const dec = Number(ta?.tokenAmount?.decimals || 0);
-    vaults.push({ mint, amt, dec, addr:a });
+    vaults.push({ mint, amt });
   }
   vaults.sort((a,b)=>b.amt - a.amt);
   const top = vaults.slice(0, 6);
@@ -274,7 +311,7 @@ async function resolveMintsByLargestVaults(rayAccounts, lpMint){
   return { baseMint:null, quoteMint:null, source:"largest-none" };
 }
 
-// ===== Fallback: vault mint frekvencia =====
+// ===== 4) Fallback: vault mint frekvencia =====
 async function resolveMintsFallback(rayAccounts, lpMint){
   const freq = new Map();
   let checked = 0;
@@ -314,21 +351,32 @@ async function processSignature(sig){
       for (const a of accs) rayAccounts.add(a);
     }
   }
+  // + message accountKeys is
+  const msgKeys = tx?.transaction?.message?.accountKeys || [];
+  for (const k of msgKeys) {
+    const pk = typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
+    if (pk) rayAccounts.add(pk);
+  }
   dbg("rayAccounts count:", rayAccounts.size);
 
-  // --- Tokenkeg: Burn + LP mint ∈ Raydium accounts ---
+  // --- Tokenkeg: Burn + LP mint (soft-accept) ---
   let lpMint=null, burnAmountRaw=0;
   for (const ix of all){
     const pid = typeof ix?.programId==="string" ? ix.programId : null;
     if (pid!==TOKENKEG) continue;
     const isBurn = ix?.parsed?.type==="burn" || ix?.instructionName==="Burn";
     if (!isBurn) continue;
-    const mint = ix?.parsed?.info?.mint || ix?.mint;
-    if (mint && rayAccounts.has(mint)){
-      lpMint = mint;
-      burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
-      break;
+    const cand = ix?.parsed?.info?.mint || ix?.mint;
+    if (!cand) continue;
+
+    if (rayAccounts.has(cand)) {
+      lpMint = cand;
+    } else {
+      if (DEBUG) console.log(new Date().toISOString(), "[DBG] LP mint NOT in rayAccounts → soft-accept", cand);
+      lpMint = cand;
     }
+    burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
+    break;
   }
   if (!lpMint){ dbg("no LP mint match"); return; }
   dbg("LP mint:", lpMint, "burnAmountRaw:", burnAmountRaw);
@@ -362,8 +410,9 @@ async function processSignature(sig){
     return;
   }
 
-  // --- Base/Quote mints: 3-lépcsős ---
-  let res = await resolveMintsFromState(rayAccounts, lpMint);
+  // --- Base/Quote mints: 4-lépcsős (balDiff → state → largest → freq) ---
+  let res = resolveMintsByBalanceDiff(tx, lpMint);
+  if (!res.baseMint){ const r1 = await resolveMintsFromState(rayAccounts, lpMint); if (r1.baseMint) res = r1; }
   if (!res.baseMint){ const r2 = await resolveMintsByLargestVaults(rayAccounts, lpMint); if (r2.baseMint) res = r2; }
   if (!res.baseMint){ const r3 = await resolveMintsFallback(rayAccounts, lpMint); if (r3.baseMint) res = r3; }
   const { baseMint, quoteMint, source } = res;
