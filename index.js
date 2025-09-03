@@ -1,10 +1,10 @@
-// Raydium LP burn watcher (Helius WS - nem enhanced) + DEBUG LOGS
-// - Aggresszív előszűrés: logsSubscribe-ben csak "Instruction: Burn" esetén dolgozunk
-// - Rate limiter: 1 getTransaction / sec (queue, dedup)
-// - Retry/backoff a RPC hívásokra
-// - Becslés a kivett SOL-ra; MIN_SOL_BURN küszöb (ENV)
-// - Telegram értesítés (opcionális, throttled)
-// - RENGETEG DEBUG LOG, hogy lásd hol akadhat el
+// Raydium LP burn watcher (Helius WS - nem enhanced) + RÉSZLETES DEBUG
+// - logsSubscribe (Raydium AMM v4 + CPMM)
+// - csak akkor fetch-el, ha Burn-hint van (de most debug-ként dumpolja a logok elejét, ha nincs)
+// - rate limiter (1 getTransaction / sec)
+// - retry/backoff RPC hívások
+// - becsült SOL-kihozatal + MIN_SOL_BURN küszöb
+// - Telegram (opcionális)
 
 import WebSocket from "ws";
 import http from "http";
@@ -17,6 +17,7 @@ const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 const DEXS_ENABLED = process.env.DEXS_ENABLED !== "0";
 const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
+const LOG_DUMP_LINES = Number(process.env.LOG_DUMP_LINES || 8);
 
 // Program IDs
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -24,7 +25,7 @@ const RAY_CPMM   = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const WSOL_MINT  = "So11111111111111111111111111111111111111112";
 
-// Quote mintek (bővíthető)
+// Quote mint jelöltek
 const QUOTE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -37,14 +38,11 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const maskUrl = (u) => {
   try {
     const url = new URL(u);
-    const params = url.searchParams;
-    if (params.has("api-key")) params.set("api-key", "***");
-    url.search = params.toString();
+    if (url.searchParams.has("api-key")) url.searchParams.set("api-key", "***");
     return url.toString();
   } catch { return u; }
 };
 
-// ==== Health HTTP (Render health check) ====
 http.createServer((_, res) => { res.writeHead(200, {"content-type":"text/plain"}); res.end("ok\n"); })
   .listen(PORT, () => {
     log("Service booted.");
@@ -54,9 +52,10 @@ http.createServer((_, res) => { res.writeHead(200, {"content-type":"text/plain"}
     log("ENV TG enabled:", !!(TG_BOT_TOKEN && TG_CHAT_ID));
     log("ENV DEXS_ENABLED:", DEXS_ENABLED);
     log("ENV MIN_SOL_BURN:", MIN_SOL_BURN);
+    log("ENV LOG_DUMP_LINES:", LOG_DUMP_LINES);
   });
 
-// ==== JSON-RPC helpers ====
+// ==== JSON-RPC ====
 async function rpc(method, params) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
   let r;
@@ -73,13 +72,10 @@ async function rpc(method, params) {
 }
 async function getParsedAccountInfo(pubkey){ return rpc("getParsedAccountInfo", [pubkey, {commitment:"confirmed"}]); }
 async function getTokenLargestAccounts(mint){ return rpc("getTokenLargestAccounts", [mint, {commitment:"confirmed"}]); }
-
 async function getTransaction(signature, tries = 3) {
   for (let i=0;i<tries;i++){
     try{
-      const res = await rpc("getTransaction", [signature, {encoding:"jsonParsed", maxSupportedTransactionVersion:0}]);
-      if (!res) log("getTransaction returned null for", signature);
-      return res;
+      return await rpc("getTransaction", [signature, {encoding:"jsonParsed", maxSupportedTransactionVersion:0}]);
     } catch(e){
       log(`getTransaction fail (${i+1}/${tries}) for ${signature}:`, e.message);
       if (i<tries-1) await new Promise(r=>setTimeout(r, 1500*(i+1)));
@@ -196,16 +192,14 @@ async function tokenAccountInfo(pubkey){
   return d?.type === "account" ? d?.info : null;
 }
 
-// ==== fő feldolgozás ====
+// ===== fő feldolgozás =====
 async function processSignature(sig){
-  log("processSignature start:", sig);
   const tx = await getTransaction(sig);
   if (!tx){ log("no tx, abort", sig); return; }
 
   const top = tx?.transaction?.message?.instructions || [];
   const inner = (tx?.meta?.innerInstructions || []).flatMap(x => x?.instructions || []);
   const all = [...top, ...inner];
-  log("instructions:", { top: top.length, inner: inner.length, all: all.length });
 
   // Raydium accounts
   const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM]);
@@ -217,9 +211,8 @@ async function processSignature(sig){
       for (const a of accs) rayAccounts.add(a);
     }
   }
-  log("rayAccounts collected:", rayAccounts.size);
 
-  // Find LP burn (Tokenkeg: Burn where mint ∈ rayAccounts)
+  // LP burn keresés
   let lpMint=null, burnAmount=0;
   for (const ix of all){
     const pid = typeof ix?.programId === "string" ? ix.programId : null;
@@ -233,8 +226,7 @@ async function processSignature(sig){
       break;
     }
   }
-  if (!lpMint){ log("no LP burn (Tokenkeg Burn not matching Raydium accounts)"); return; }
-  log("LP mint:", lpMint, "burnAmount(raw):", burnAmount);
+  if (!lpMint) { log("no LP burn (Tokenkeg Burn not matching Raydium accounts)"); return; }
 
   const blockTimeMs = tx?.blockTime ? tx.blockTime*1000 : Date.now();
 
@@ -250,7 +242,6 @@ async function processSignature(sig){
   }catch(e){ log("mint info err:", e.message); }
   const supplyPre = supplyPost + burnAmount;
   const share = supplyPre>0 ? (burnAmount/supplyPre) : 0;
-  log("supplyPre(raw):", supplyPre, "share:", share);
 
   // WSOL vault becslés
   let wsolVaultAmountRaw=0, wsolDecimals=9;
@@ -268,14 +259,13 @@ async function processSignature(sig){
   }
   const wsolVaultSOL = wsolVaultAmountRaw / Math.pow(10, wsolDecimals);
   const estSolOut = share * wsolVaultSOL;
-  log("WSOL vault SOL:", wsolVaultSOL, "estSolOut:", estSolOut, "min:", MIN_SOL_BURN);
 
   if (MIN_SOL_BURN>0 && estSolOut < MIN_SOL_BURN){
     log(`SKIP by MIN_SOL_BURN: ${estSolOut.toFixed(4)} < ${MIN_SOL_BURN}`);
     return;
   }
 
-  // Underlying token mints (Dexs infohoz)
+  // Underlying token mints (Dexs)
   const candidateMints=[]; let uChecked=0;
   for (const a of rayAccounts){
     if (a===lpMint) continue;
@@ -292,13 +282,10 @@ async function processSignature(sig){
     else if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) { quoteMint=m2; baseMint=m1; }
     else { baseMint=m1; quoteMint=m2; }
   }
-  log("pair mints:", { baseMint, quoteMint });
 
-  // Dexscreener
   let dexs=null;
   if (DEXS_ENABLED && baseMint){
     dexs = await fetchDexsByToken(baseMint);
-    log("dexscreener present:", !!dexs);
   }
 
   // Top LP holders
@@ -351,7 +338,7 @@ async function processSignature(sig){
   await sendTelegram(msg);
 }
 
-// ==== WebSocket (Helius WSS - nem enhanced) ====
+// ==== WebSocket (Helius WSS) + DEBUG dump ====
 let ws;
 function wsSend(obj){ if (ws && ws.readyState===ws.OPEN) ws.send(JSON.stringify(obj)); }
 function subscribeLogs(programId, id){
@@ -374,15 +361,23 @@ function connectWS(){
     try{
       const data = JSON.parse(ev.data.toString());
       if (data?.result && data?.id){ log("WS sub ack id:", data.id, "sub:", data.result); return; }
+
       const res = data?.params?.result;
       const sig = res?.value?.signature;
       const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
       if (!sig){ return; }
       log("WS event:", sig, "logsLen=", logsArr.length);
 
-      // csak ha tényleg Burn log szerepel
+      // Burn hint keresés
       const hasBurnLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*Burn/i.test(l));
-      if (!hasBurnLog){ log("no Burn hint in logs → skip fetch"); return; }
+      if (!hasBurnLog) {
+        // DEBUG: mintát dobunk a logokból + Tokenkeg invoke számlálás
+        const tokenInvokeCnt = logsArr.filter(l => typeof l==="string" && l.includes(`Program ${TOKENKEG} invoke`)).length;
+        const sample = logsArr.slice(0, LOG_DUMP_LINES).map((l,i)=>`[${i}] ${String(l).slice(0,220)}`);
+        log(`no Burn hint in logs → skip fetch | tokenkegInvoke=${tokenInvokeCnt}`);
+        log("logs sample:", `\n${sample.join("\n")}`);
+        return;
+      }
 
       await enqueueSignature(sig);
     }catch(e){
@@ -390,17 +385,11 @@ function connectWS(){
     }
   };
 
-  ws.onclose = () => {
-    log("WS closed, reconnect in 3s");
-    setTimeout(connectWS, 3000);
-  };
-
-  ws.onerror = (e) => {
-    log("WS error:", e?.message || String(e));
-  };
+  ws.onclose = () => { log("WS closed, reconnect in 3s"); setTimeout(connectWS, 3000); };
+  ws.onerror = (e) => { log("WS error:", e?.message || String(e)); };
 }
 
-// keep-alive ping (néha segít ingyenes instán)
+// keep-alive ping
 setInterval(()=> { try{ ws?.ping?.(); }catch{} }, 30000);
 
 connectWS();
