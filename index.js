@@ -1,6 +1,8 @@
-// Raydium LP burn watcher → TG kártya (Dexs + on-chain + pool stateből mints)
-// WS (nem enhanced): csak ha a WS logban "Instruction: Burn"
-// 1 tx/s rate limit, TG throttle, MIN_SOL_BURN (WSOL vault alapján)
+// Raydium LP burn watcher → TG (Dexs + on-chain)
+// WS (nem enhanced): "Instruction: Burn" előszűrés
+// 1 tx/s limit, TG throttle, MIN_SOL_BURN küszöb
+// Base/Quote: (1) pool state RAW scan → (2) largest vaults → (3) freq fallback
+// DEBUG=1 env bekapcsolja a részletes logolást
 
 import WebSocket from "ws";
 import http from "http";
@@ -12,6 +14,7 @@ const RPC_WSS  = process.env.RPC_WSS  || "wss://api.mainnet-beta.solana.com";
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);
+const DEBUG = process.env.DEBUG === "1";
 
 // ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -20,7 +23,6 @@ const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const WSOL_MINT  = "So11111111111111111111111111111111111111112";
 const METAPLEX_META = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
-// gyakori quote-ok
 const QUOTE_MINTS = new Set([
   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
@@ -30,6 +32,8 @@ const QUOTE_MINTS = new Set([
 
 // ===== Logger + health =====
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const dbg = (...a) => { if (DEBUG) console.log(new Date().toISOString(), "[DBG]", ...a); };
+
 http.createServer((_, res)=>{res.writeHead(200,{"content-type":"text/plain"});res.end("ok\n");})
   .listen(PORT, ()=>log(`HTTP up on :${PORT}`));
 
@@ -81,11 +85,10 @@ async function tokenAccountInfo(pubkey){
 async function fetchDexscreenerByToken(mint){
   try{
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers:{accept:"application/json"} });
-    if (!r.ok) return null;
+    if (!r.ok) { dbg("dexs HTTP", r.status); return null; }
     const j = await r.json();
     const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
-    if (!pairs.length) return null;
-    // Prefer Raydium + nagyobb likviditás
+    if (!pairs.length) { dbg("dexs pairs=0"); return null; }
     pairs.sort((a,b)=>{
       const ra = (a?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
       const rb = (b?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
@@ -93,7 +96,7 @@ async function fetchDexscreenerByToken(mint){
       return (b?.liquidity?.usd||0) - (a?.liquidity?.usd||0);
     });
     const p = pairs[0];
-    return {
+    const out = {
       name:   p?.baseToken?.name   || null,
       symbol: p?.baseToken?.symbol || null,
       price:  p?.priceUsd ? Number(p.priceUsd) : null,
@@ -102,7 +105,9 @@ async function fetchDexscreenerByToken(mint){
       mcap:   p?.marketCap ? Number(p.marketCap) : null,
       url:    p?.url || null
     };
-  }catch{ return null; }
+    dbg("dexs ok:", out);
+    return out;
+  }catch(e){ dbg("dexs err:", e.message); return null; }
 }
 
 // ===== Metaplex metadata (name, symbol, isMutable) =====
@@ -125,13 +130,13 @@ async function fetchMetaplexMetadata(mint) {
     readStr(); readU16();
     const hasCreators = readU8();
     if (hasCreators === 1) { const n = readU32(); for (let i=0;i<n;i++){ skipPk(); readU8(); readU8(); } }
-    readU8(); // primarySale
+    readU8();
     const isMutable = !!readU8();
     return { name, symbol, isMutable };
   } catch { return null; }
 }
 
-// ===== Base58 encode (Bitcoin alphabet) =====
+// ===== Base58 encode =====
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function bs58encode(buf){
   if (!buf || !buf.length) return "";
@@ -201,9 +206,8 @@ function ago(tsMs){
   const d = Math.floor(h/24); return `${d} days ago`;
 }
 
-// ===== Mints a pool state RAW accountból (direkt) =====
+// ===== Mints a pool state RAW accountból =====
 async function resolveMintsFromState(rayAccounts, lpMint) {
-  // csak Raydium program által birtokolt accountokat nézünk (state jelöltek)
   const stateCandidates = [];
   for (const acc of rayAccounts) {
     try{
@@ -213,57 +217,82 @@ async function resolveMintsFromState(rayAccounts, lpMint) {
         const b64 = info?.value?.data?.[0];
         if (b64) stateCandidates.push(Buffer.from(b64, "base64"));
       }
-      if (stateCandidates.length >= 6) break; // elég pár jelölt
+      if (stateCandidates.length >= 6) break;
     }catch{}
   }
-  // végigmegyünk a state jelölteken és a raw bájtokból kiszedjük a 32-bytes "pubkey" ablakokat
+  dbg("stateCandidates:", stateCandidates.length);
   for (const buf of stateCandidates) {
     const seen = new Set();
     const found = [];
     for (let off = 0; off + 32 <= buf.length; off++) {
-      const pkBytes = buf.slice(off, off + 32);
-      const pk = bs58encode(pkBytes);
+      const pk = bs58encode(buf.slice(off, off + 32));
       if (seen.has(pk)) continue; seen.add(pk);
-      if (pk.length < 32 || pk.length > 44) continue; // gyors szűrő
+      if (pk.length < 32 || pk.length > 44) continue;
       if (pk === lpMint) continue;
-      // validáld mintként (olcsó cache-elt hívás)
       const mintInfo = await isMintAccount(pk);
       if (mintInfo) {
         found.push(pk);
         if (found.length > 4) break;
       }
     }
-    // ha pont két jó mintet találtunk ebben a state-ben → kész
     const uniq = [...new Set(found)];
+    dbg("state found uniq mints:", uniq.length, uniq.slice(0,4));
     if (uniq.length === 2) {
       const [m1, m2] = uniq;
-      if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1 };
-      if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2 };
-      return { baseMint:m1, quoteMint:m2 };
+      if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"state" };
+      if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"state" };
+      return { baseMint:m1, quoteMint:m2, source:"state" };
     }
   }
-  // ha nem sikerült, jelezd
-  return { baseMint:null, quoteMint:null };
+  return { baseMint:null, quoteMint:null, source:"state-none" };
 }
 
-// Fallback: vault token-acc mint frekvencia
+// ===== ÚJ: Largest vaults stratégia =====
+async function resolveMintsByLargestVaults(rayAccounts, lpMint){
+  const vaults = [];
+  let checked = 0;
+  for (const a of rayAccounts){
+    if (checked++ > 120) break;
+    const ta = await tokenAccountInfo(a);
+    if (!ta) continue;
+    const mint = ta?.mint;
+    if (!mint || mint === lpMint) continue;
+    const amt = Number(ta?.tokenAmount?.amount || 0);
+    const dec = Number(ta?.tokenAmount?.decimals || 0);
+    vaults.push({ mint, amt, dec, addr:a });
+  }
+  vaults.sort((a,b)=>b.amt - a.amt);
+  const top = vaults.slice(0, 6);
+  dbg("vaults top:", top.map(v=>({mint:v.mint, amt:v.amt})));
+  const uniqMints = [...new Set(top.map(v=>v.mint))];
+  if (uniqMints.length >= 2){
+    const [m1, m2] = uniqMints.slice(0,2);
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"largest" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"largest" };
+    return { baseMint:m1, quoteMint:m2, source:"largest" };
+  }
+  return { baseMint:null, quoteMint:null, source:"largest-none" };
+}
+
+// ===== Fallback: vault mint frekvencia =====
 async function resolveMintsFallback(rayAccounts, lpMint){
   const freq = new Map();
   let checked = 0;
   for (const a of rayAccounts){
-    if (checked++ > 80) break;
+    if (checked++ > 120) break;
     const ta = await tokenAccountInfo(a);
     const m = ta?.mint;
     if (m && m !== lpMint) freq.set(m, (freq.get(m)||0) + 1);
   }
   const sorted = [...freq.entries()].sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
+  dbg("freq sorted:", sorted.slice(0,4));
   if (sorted.length >= 2){
     const [m1,m2] = sorted.slice(0,2);
-    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1 };
-    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2 };
-    return { baseMint:m1, quoteMint:m2 };
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"freq" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"freq" };
+    return { baseMint:m1, quoteMint:m2, source:"freq" };
   }
-  return { baseMint:null, quoteMint:null };
+  return { baseMint:null, quoteMint:null, source:"freq-none" };
 }
 
 // ===== Main =====
@@ -285,6 +314,7 @@ async function processSignature(sig){
       for (const a of accs) rayAccounts.add(a);
     }
   }
+  dbg("rayAccounts count:", rayAccounts.size);
 
   // --- Tokenkeg: Burn + LP mint ∈ Raydium accounts ---
   let lpMint=null, burnAmountRaw=0;
@@ -300,7 +330,8 @@ async function processSignature(sig){
       break;
     }
   }
-  if (!lpMint) return;
+  if (!lpMint){ dbg("no LP mint match"); return; }
+  dbg("LP mint:", lpMint, "burnAmountRaw:", burnAmountRaw);
 
   // --- LP supply/decimals + burn% ---
   let lpSupplyPost=0, lpDecimals=0;
@@ -316,7 +347,7 @@ async function processSignature(sig){
   // --- SOL küszöb WSOL vault alapján ---
   let wsolVaultRaw=0, wsolDecimals=9; let checked=0;
   for (const a of rayAccounts){
-    if (checked++>60) break;
+    if (checked++>80) break;
     const acc = await tokenAccountInfo(a);
     if (acc?.mint===WSOL_MINT){
       const ta = acc?.tokenAmount;
@@ -331,11 +362,14 @@ async function processSignature(sig){
     return;
   }
 
-  // --- Base/Quote mints: DIREKT a pool stateből → fallback vault-frekvencia ---
-  let { baseMint, quoteMint } = await resolveMintsFromState(rayAccounts, lpMint);
-  if (!baseMint) ({ baseMint, quoteMint } = await resolveMintsFallback(rayAccounts, lpMint));
+  // --- Base/Quote mints: 3-lépcsős ---
+  let res = await resolveMintsFromState(rayAccounts, lpMint);
+  if (!res.baseMint){ const r2 = await resolveMintsByLargestVaults(rayAccounts, lpMint); if (r2.baseMint) res = r2; }
+  if (!res.baseMint){ const r3 = await resolveMintsFallback(rayAccounts, lpMint); if (r3.baseMint) res = r3; }
+  const { baseMint, quoteMint, source } = res;
+  dbg("mint resolution:", { baseMint, quoteMint, source });
 
-  // --- Base token on-chain + Metaplex metadata ---
+  // --- Base token on-chain + Metaplex ---
   let totalSupply=0, baseDecimals=0, mintAuthNone=null, freezeNone=null;
   let metaName=null, metaSymbol=null, metaMutable=null;
   if (baseMint){
@@ -352,7 +386,7 @@ async function processSignature(sig){
   }
   const totalSupplyUi = baseDecimals ? (totalSupply/10**baseDecimals) : (totalSupply||0);
 
-  // Top holders
+  // Holders
   let holdersLines=[];
   if (baseMint){
     try{
@@ -365,7 +399,7 @@ async function processSignature(sig){
         const short = addr ? `${addr.slice(0,4)}…${addr.slice(-4)}` : "–";
         return `├ ${short} | ${amt.toLocaleString()} | ${pct.toFixed(2)}%`;
       });
-    }catch(e){ log("largest holders err:", e.message); }
+    }catch(e){ dbg("holders err:", e.message); }
   }
 
   // Dexscreener
@@ -396,8 +430,6 @@ async function processSignature(sig){
       baseMint ? `🧾 <b>Base Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Base Mint:</b> n/a`,
       `📜 <b>LP Mint:</b> <code>${lpMint}</code>`,
       "",
-      `🌐 <b>Socials</b>:\n├ ${dx.url || "n/a"}`,
-      "",
       `⚙️ <b>Security:</b>`,
       `├ Mutable Metadata: ${metaMutable===null ? "n/a" : (metaMutable ? "Yes ❌" : "No ✅")}`,
       `├ Mint Authority: ${mintAuthNone===null ? "n/a" : (mintAuthNone ? "No ✅" : "Yes ❌")}`,
@@ -407,7 +439,8 @@ async function processSignature(sig){
       ...(holdersLines.length ? holdersLines : ["├ n/a"]),
       "",
       dx.url ? dx.url : null,
-      `🔗 <a href="${link}">Solscan</a>`
+      `🔗 <a href="${link}">Solscan</a>`,
+      DEBUG ? `\n<code>mint_source=${source}</code>` : null
     ].filter(Boolean);
     await sendTelegram(lines.join("\n"));
     log(`TG card (Dexs) → ${headTitle} | burn=${burnPct}% | sig=${sig}`);
@@ -418,14 +451,15 @@ async function processSignature(sig){
       `Amount: ${burnAmountRaw}`,
       `Est. SOL from LP: ${estSolOut.toFixed(4)} SOL`,
       when ? `Time: ${when}` : null,
-      `Sig: <a href="${link}">${sig}</a>`
+      `Sig: <a href="${link}">${sig}</a>`,
+      DEBUG && baseMint ? `\n<code>mint_source=${source} base=${baseMint}</code>` : null
     ].filter(Boolean).join("\n");
     await sendTelegram(msg);
     log(`TG simple → burn=${burnPct}% | sig=${sig}`);
   }
 }
 
-// ===== WebSocket (Helius WSS – agresszív előszűrés) =====
+// ===== WebSocket =====
 let ws;
 function wsSend(obj){ if (ws && ws.readyState===ws.OPEN) ws.send(JSON.stringify(obj)); }
 function subscribeLogs(programId, id){
