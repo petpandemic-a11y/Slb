@@ -1,7 +1,8 @@
-// Raydium LP burn watcher (Helius WS - nem enhanced)
-// WS: logsSubscribe Raydium AMM v4 + CPMM -> signature
+// Raydium LP burn watcher (Helius WS - nem enhanced, credit-kímélő)
+// WS: logsSubscribe Raydium AMM v4 + CPMM -> signature + LOGS
+//   -> csak akkor kérünk le tx-t, ha a LOG-okban Burn-re utalás van
 // HTTP RPC: getTransaction(jsonParsed) -> inner Tokenkeg: Burn
-// LP-burn jelzés akkor, ha a Burn mint szerepel a Raydium-instrukciók accountjai között
+// LP-burn jelzés: a Burn mint szerepel a Raydium-instrukciók accountjai között
 // Opcionális Telegram értesítés (throttled)
 
 import WebSocket from "ws";
@@ -47,11 +48,23 @@ async function rpc(method, params) {
   return j.result;
 }
 
-async function getTransaction(signature) {
-  return rpc("getTransaction", [
-    signature,
-    { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }
-  ]);
+// retry wrapper (Render/Helius néha dob)
+async function getTransaction(signature, tries = 3) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await rpc("getTransaction", [
+        signature,
+        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }
+      ]);
+    } catch (e) {
+      log(`getTransaction fail (${i + 1}/${tries}):`, e.message);
+      if (i < tries - 1) {
+        await new Promise(r => setTimeout(r, 1500 * (i + 1))); // backoff
+        continue;
+      }
+      return null;
+    }
+  }
 }
 
 // ---- Telegram (egyszerű sor + throttle) ----
@@ -102,7 +115,7 @@ function wsSend(obj) {
 }
 
 function subscribeLogs(programId, id) {
-  // logsSubscribe -> a megadott programot “említő” tx-ek signature-jeit adja
+  // logsSubscribe -> a megadott programot “említő” tx-ek logjait adja (signature + logs)
   const msg = {
     jsonrpc: "2.0",
     id,
@@ -121,7 +134,6 @@ function connectWS() {
 
   ws.onopen = () => {
     log("WS open");
-    // Két külön Raydium programra iratkozunk fel
     subscribeLogs(RAY_AMM_V4, 1001);
     subscribeLogs(RAY_CPMM,   1002);
   };
@@ -129,12 +141,28 @@ function connectWS() {
   ws.onmessage = async (ev) => {
     try {
       const data = JSON.parse(ev.data.toString());
+      const res = data?.params?.result;
+      const sig  = res?.value?.signature;
+      const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
 
-      // Az első válaszok a subscription ID-k; a tényleges eseményekben params.result.value.signature van
-      const sig = data?.params?.result?.value?.signature;
       if (!sig) return;
 
-      // Részletes tranzakció beolvasása (jsonParsed, inner instrukciókkal)
+      // --- OLCSÓ ELŐSZŰRÉS A LOGOKON ---
+      // 1) Ha nem látszik "Instruction: Burn" -> ne kérjünk le tx-et
+      // 2) Vagy legalább legyen Tokenkeg invoke a logokban
+      const hasBurnHint = logsArr.some(l =>
+        typeof l === "string" && /Instruction:\s*Burn/i.test(l)
+      );
+      const hasTokenInvoke = logsArr.some(l =>
+        typeof l === "string" && l.includes(`Program ${TOKENKEG} invoke`)
+      );
+
+      if (!hasBurnHint && !hasTokenInvoke) {
+        // nagy valószínűséggel nincs benne Burn -> spórolunk egy RPC-t
+        return;
+      }
+
+      // --- Csak most kérjük le a teljes tx-t ---
       const tx = await getTransaction(sig);
       if (!tx) return;
 
@@ -165,7 +193,6 @@ function connectWS() {
 
         const mint = ix?.parsed?.info?.mint || ix?.mint;
         if (!mint) continue;
-
         if (!rayAccounts.has(mint)) continue; // nem Raydium LP mint
 
         const amount = ix?.parsed?.info?.amount || ix?.amount;
@@ -180,7 +207,7 @@ function connectWS() {
           `Sig: <a href="${link}">${sig}</a>`
         ].filter(Boolean).join("\n");
 
-        log(msg.replace(/<[^>]+>/g, "")); // plain log
+        log(msg.replace(/<[^>]+>/g, ""));
         await sendTelegram(msg);
         break; // egy tx-ben elég egyszer jelezni
       }
