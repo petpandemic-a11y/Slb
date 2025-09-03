@@ -1,0 +1,9 @@
+{
+  "name": "raydium-lp-burn-watcher",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
