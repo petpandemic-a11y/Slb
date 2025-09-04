@@ -1,4 +1,4 @@
-// index.js — Raydium LP burn watcher (RELAXED + mini-cache középút)
+// index.js — Raydium LP burn watcher (RELAXED + mini-cache, subscription-ID routing)
 
 import WebSocket from "ws";
 import http from "http";
@@ -16,9 +16,9 @@ const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
 
 // Tuning
 const STRICT_LP_MATCH   = (process.env.STRICT_LP_MATCH ?? "false").toLowerCase() === "true";
-const CACHE_WINDOW_MIN  = Number(process.env.CACHE_WINDOW_MIN || 5);  // perc
-const CACHE_MIN_FREQ    = Number(process.env.CACHE_MIN_FREQ   || 3);  // min. megjelenés a windowban
-const RATE_TX_PER_SEC   = Math.max(0.2, Number(process.env.RATE_TX_PER_SEC || 1.0)); // 1 tx / sec alap
+const CACHE_WINDOW_MIN  = Number(process.env.CACHE_WINDOW_MIN || 5);   // perc
+const CACHE_MIN_FREQ    = Number(process.env.CACHE_MIN_FREQ   || 3);   // min. előfordulás a windowban
+const RATE_TX_PER_SEC   = Math.max(0.2, Number(process.env.RATE_TX_PER_SEC || 1.0)); // 1 tx / sec default
 
 // Program IDs
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
@@ -60,11 +60,8 @@ async function getTransaction(signature, tries = 3) {
       ]);
     } catch (e) {
       dbg(`getTransaction fail (${i + 1}/${tries}):`, e.message);
-      if (i < tries - 1) {
-        await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
-      } else {
-        return null;
-      }
+      if (i < tries - 1) await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
+      else return null;
     }
   }
 }
@@ -98,7 +95,7 @@ async function sendTelegram(text) {
           if (jr?.parameters?.retry_after) wait = (jr.parameters.retry_after * 1000) | 0;
         } catch {}
         await new Promise((r) => setTimeout(r, wait));
-        tgQueue.unshift(msg); // retry
+        tgQueue.unshift(msg);
       } else {
         await new Promise((r) => setTimeout(r, 1100));
       }
@@ -132,7 +129,6 @@ async function enqueueSignature(sig, src) {
 }
 
 // ===== Raydium mini-cache =====
-
 // Map<mint, {ts:number, freq:number}>
 const rayMintCache = new Map();
 
@@ -158,8 +154,7 @@ function cachePrune() {
 function cacheAccepts(mint) {
   cachePrune();
   const it = rayMintCache.get(mint);
-  if (!it) return false;
-  return it.freq >= CACHE_MIN_FREQ;
+  return !!it && it.freq >= CACHE_MIN_FREQ;
 }
 
 // ===== Core processing =====
@@ -167,11 +162,11 @@ async function processSignature(sig, sourceTag = "") {
   const tx = await getTransaction(sig);
   if (!tx) return;
 
-  const top = tx?.transaction?.message?.instructions || [];
+  const top   = tx?.transaction?.message?.instructions || [];
   const inner = (tx?.meta?.innerInstructions || []).flatMap((x) => x?.instructions || []);
   const all   = [...top, ...inner];
 
-  // 1) Gyűjtsünk MINDEN Raydium accountot (cache-hez is!)
+  // 1) Raydium accounts gyűjtése (és cache bump)
   const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM]);
   const rayAccounts = new Set();
   for (const ix of all) {
@@ -182,51 +177,44 @@ async function processSignature(sig, sourceTag = "") {
         .filter(Boolean);
       for (const a of accs) {
         rayAccounts.add(a);
-        cacheBump(a); // mini-cache: minden Raydium-account növeli a saját „nyomát”
+        cacheBump(a);
       }
     }
   }
 
-  // 2) Keressünk SPL Token Burn/BurnChecked utasításokat
+  // 2) Token-burn(ok) keresése
   const burns = [];
   for (const ix of all) {
     const pid = typeof ix?.programId === "string" ? ix.programId : null;
     if (pid !== TOKENKEG) continue;
-
     const type = ix?.parsed?.type?.toLowerCase?.() || ix?.instructionName?.toLowerCase?.();
     if (type === "burn" || type === "burnchecked") {
       const info  = ix?.parsed?.info || {};
       const mint  = info.mint || ix?.mint;
-      const amt   = info.amount || ix?.amount; // raw (base units)
-      const owner = info?.owner || info?.authority;
-      if (mint) {
-        burns.push({ mint, amount: amt, owner });
-      }
+      const amt   = info.amount || ix?.amount;
+      if (mint) burns.push({ mint, amount: amt });
     }
   }
 
-  if (burns.length === 0) {
+  if (!burns.length) {
     dbg("skip: no burn in tx", sig.slice(0, 8));
     return;
   }
 
-  // 3) Döntés burnönként: same-tx LP match, különben mini-cache
+  // 3) Döntés: same-tx LP → ok; különben cache alapján
   for (const b of burns) {
     const { mint, amount } = b;
 
-    // A) same-tx LP-mint?
     if (rayAccounts.has(mint)) {
       await announce(sig, mint, amount, tx, "same-tx");
-      return; // egy tx-ből egy jelzés elég
+      return;
     }
 
-    // B) ha strict, itt vége
     if (STRICT_LP_MATCH) {
       dbg("no LP mint match (strict)", mint);
       continue;
     }
 
-    // C) mini-cache: gyakori Raydium-nyom a windowban?
     if (cacheAccepts(mint)) {
       await announce(sig, mint, amount, tx, "cache");
       return;
@@ -236,13 +224,12 @@ async function processSignature(sig, sourceTag = "") {
   }
 }
 
-// Jelentés (TG)
 async function announce(sig, mint, amountRaw, tx, how) {
   const when = tx?.blockTime ? new Date(tx.blockTime * 1000).toISOString() : "";
   const solscan = `https://solscan.io/tx/${sig}`;
 
   const title = "Solana LP Burns\nRaydium LP Burn";
-  const lines = [
+  const msg = [
     `<b>${title}</b>`,
     `🔥 Burn Percentage: 100.00%`,
     `🕒 Burn Time: ${when || "n/a"}`,
@@ -251,27 +238,37 @@ async function announce(sig, mint, amountRaw, tx, how) {
     ``,
     `🔗 <a href="${solscan}">Solscan</a>`,
     how ? `<i>source: ${how}</i>` : null
-  ].filter(Boolean);
+  ].filter(Boolean).join("\n");
 
-  const msg = lines.join("\n");
   log(`[ALERT] ${how} | mint=${mint} | sig=${sig}`);
   await sendTelegram(msg);
 }
 
-// ===== WebSocket (Helius) =====
+// ===== WebSocket (Helius) — subscription-ID routing =====
 let ws;
+let rid = 2000;                                  // request id számláló
+const pending = {};                              // reqId -> label
+const subs    = { rayAmm: null, rayCpmm: null, token: null };  // label -> subId
 
 function wsSend(obj) {
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
 }
 
-function subscribeLogs(programId, id) {
+function subscribeLogs(programId, label) {
+  const id = ++rid;
+  pending[id] = label;
   wsSend({
     jsonrpc: "2.0",
     id,
     method: "logsSubscribe",
     params: [{ mentions: [programId] }, { commitment: "confirmed" }]
   });
+  dbg(`subscribe sent: ${label} -> reqId ${id}`);
+}
+
+function labelBySubId(subId) {
+  for (const [k, v] of Object.entries(subs)) if (v === subId) return k;
+  return null;
 }
 
 function connectWS() {
@@ -280,43 +277,52 @@ function connectWS() {
 
   ws.onopen = () => {
     log("WS open");
-
-    // 1) Raydium AMM v4 + CPMM — mindig gyűjtjük a cache-hez
-    subscribeLogs(RAY_AMM_V4, 1001);
-    subscribeLogs(RAY_CPMM,   1002);
-
-    // 2) Token Program — csak akkor sorolunk be, ha a logban Burn/BurnChecked
-    subscribeLogs(TOKENKEG,   1003);
+    // Feliratkozások — a válaszban kapunk subscription ID-t
+    subscribeLogs(RAY_AMM_V4, "rayAmm");
+    subscribeLogs(RAY_CPMM,   "rayCpmm");
+    subscribeLogs(TOKENKEG,   "token");
   };
 
   ws.onmessage = async (ev) => {
     try {
       const data = JSON.parse(ev.data.toString());
-      const res = data?.params?.result;
-      if (!res) return;
 
-      const sig     = res?.value?.signature;
-      const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
-      const logStr  = logsArr.join("\n");
+      // 1) Feliratkozás-ACK: { id: <reqId>, result: <subscriptionId> }
+      if (data?.id && data?.result && pending[data.id]) {
+        const label = pending[data.id];
+        subs[label] = data.result;
+        delete pending[data.id];
+        dbg(`sub ack: ${label} -> subId ${subs[label]}`);
+        return;
+      }
 
-      // Token Program csatorna: csak Burn logra
-      const isTokenStream = (res?.value?.programId === TOKENKEG);
-      if (isTokenStream) {
-        const hasBurnLog = /Instruction:\s*Burn(?:Checked)?/i.test(logStr);
-        if (hasBurnLog) {
-          return enqueueSignature(sig, "token-burn-log");
+      // 2) Esemény: { method: "logsNotification", params: { subscription, result } }
+      if (data?.method === "logsNotification") {
+        const subId = data?.params?.subscription;
+        const label = labelBySubId(subId);
+        const res   = data?.params?.result;
+        if (!label || !res) return;
+
+        const sig     = res?.value?.signature;
+        const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
+        if (!sig || logsArr.length === 0) return;
+
+        if (label === "token") {
+          // Csak Burn / BurnChecked logokra
+          const hasBurnLog = logsArr.some((l) => /Instruction:\s*Burn(?:Checked)?/i.test(l));
+          if (hasBurnLog) {
+            dbg(`token burn log -> enqueue ${sig.slice(0, 8)}`);
+            return enqueueSignature(sig, "token-burn-log");
+          }
+          return;
         }
-        return; // token stream, de nem burn
-      }
 
-      // Raydium csatorna: minden tx-t feldolgozunk (cache-hez is kell)
-      const isRayStream = (res?.value?.programId === RAY_AMM_V4 || res?.value?.programId === RAY_CPMM);
-      if (isRayStream) {
-        // Raydiumból is jöhet burn ugyanabban a tx-ben → feldolgozzuk
-        // (Ha nincs benne burn, a processSignature úgyis "skip: no burn" és közben a cache-et frissíti.)
-        return enqueueSignature(sig, "ray-stream");
+        if (label === "rayAmm" || label === "rayCpmm") {
+          // Raydium csatornáról minden tx mehet a feldolgozásra (cache-hez is kell)
+          dbg(`ray stream -> enqueue ${sig.slice(0, 8)}`);
+          return enqueueSignature(sig, "ray-stream");
+        }
       }
-
     } catch (e) {
       dbg("WS msg err:", e.message);
     }
