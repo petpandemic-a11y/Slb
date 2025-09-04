@@ -1,341 +1,538 @@
-// index.js — Raydium LP burn watcher (RELAXED + mini-cache, subscription-ID routing)
+// Raydium LP burn watcher → Telegram (STRICT, no-dup, young tokens)
+// - WS logsSubscribe: csak "Instruction: Burn" esetén kérünk le tx-t
+// - Tokenkeg: Burn + a burn mintje a Raydium accounts közt (LP mint) → csak akkor jelzünk
+// - Min. LP burn % (MIN_LP_BURN_PCT), min. becsült SOL (MIN_SOL_BURN), max. token kor (MAX_TOKEN_AGE_MIN)
+// - Perzisztens dedup (signature) → nincs duplikált poszt
+// - TG üzenet: csak a Token Mint (contract) + alap adatok
 
 import WebSocket from "ws";
 import http from "http";
+import fs from "fs";
 
 // ===== ENV =====
-const PORT = Number(process.env.PORT || 10000);
-
-// Helius / Solana RPC
+const PORT = Number(process.env.PORT || 8080);
 const RPC_HTTP = process.env.RPC_HTTP || "https://api.mainnet-beta.solana.com";
 const RPC_WSS  = process.env.RPC_WSS  || "wss://api.mainnet-beta.solana.com";
-
-// Telegram
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const TG_CHAT_ID   = process.env.TG_CHAT_ID   || "";
+const MIN_SOL_BURN = Number(process.env.MIN_SOL_BURN || 0);         // becsült SOL a poolból (WSOL vault alapján)
+const MIN_LP_BURN_PCT = Number(process.env.MIN_LP_BURN_PCT || 0.99); // 0.99 = 99%
+const MAX_TOKEN_AGE_MIN = Number(process.env.MAX_TOKEN_AGE_MIN || 0); // 0 = kikapcsolva
+const DEBUG = process.env.DEBUG === "1";
+const RATE_MS = Number(process.env.RATE_MS || 1200);
 
-// Tuning
-const STRICT_LP_MATCH   = (process.env.STRICT_LP_MATCH ?? "false").toLowerCase() === "true";
-const CACHE_WINDOW_MIN  = Number(process.env.CACHE_WINDOW_MIN || 5);   // perc
-const CACHE_MIN_FREQ    = Number(process.env.CACHE_MIN_FREQ   || 3);   // min. előfordulás a windowban
-const RATE_TX_PER_SEC   = Math.max(0.2, Number(process.env.RATE_TX_PER_SEC || 1.0)); // 1 tx / sec default
-
-// Program IDs
+// ===== Program IDs =====
 const RAY_AMM_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const RAY_CPMM   = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const TOKENKEG   = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const WSOL_MINT  = "So11111111111111111111111111111111111111112";
+const METAPLEX_META = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
-// ===== Logger =====
+// Gyakori quote mint-ek
+const QUOTE_MINTS = new Set([
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", // USDT
+  WSOL_MINT,
+  "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  // BONK
+]);
+
+// ===== Logger + health =====
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-const dbg = (...a) => console.log(new Date().toISOString(), "[DBG]", ...a);
+const dbg = (...a) => { if (DEBUG) console.log(new Date().toISOString(), "[DBG]", ...a); };
 
-// ===== Health HTTP (Render) =====
-http
-  .createServer((_, res) => {
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("ok\n");
-  })
-  .listen(PORT, () => log(`HTTP up on :${PORT}`));
+http.createServer((_, res)=>{res.writeHead(200,{"content-type":"text/plain"});res.end("ok\n");})
+  .listen(PORT, ()=>log(`HTTP up on :${PORT}`));
 
-// ===== JSON-RPC helpers =====
+// ===== JSON-RPC =====
 async function rpc(method, params) {
-  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
-  const r = await fetch(RPC_HTTP, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body
-  });
+  const body = JSON.stringify({ jsonrpc:"2.0", id:1, method, params });
+  const r = await fetch(RPC_HTTP, { method:"POST", headers:{ "content-type":"application/json" }, body });
   if (!r.ok) throw new Error(`RPC ${method} HTTP ${r.status}`);
-  const j = await r.json();
-  if (j.error) throw new Error(`RPC ${method} error: ${JSON.stringify(j.error)}`);
+  const j = await r.json(); if (j.error) throw new Error(`RPC ${method} err: ${JSON.stringify(j.error)}`);
   return j.result;
 }
-
-async function getTransaction(signature, tries = 3) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await rpc("getTransaction", [
-        signature,
-        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }
-      ]);
-    } catch (e) {
-      dbg(`getTransaction fail (${i + 1}/${tries}):`, e.message);
-      if (i < tries - 1) await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
-      else return null;
+async function getTransaction(signature, tries=3){
+  for (let i=0;i<tries;i++){
+    try{
+      return await rpc("getTransaction",[signature,{encoding:"jsonParsed",maxSupportedTransactionVersion:0}]);
+    }catch(e){
+      log(`getTransaction fail (${i+1}/${tries}) ${signature}:`, e.message);
+      if (i<tries-1) await new Promise(r=>setTimeout(r,1500*(i+1)));
     }
   }
+  return null;
 }
+async function getParsedAccountInfo(pubkey){ return rpc("getParsedAccountInfo",[pubkey,{commitment:"confirmed"}]); }
+async function getAccountInfoRaw(pubkey){ return rpc("getAccountInfo",[pubkey,{commitment:"confirmed",encoding:"base64"}]); }
+async function getProgramAccounts(programId, filters=[]) {
+  return rpc("getProgramAccounts", [ programId, { commitment:"confirmed", encoding:"base64", filters } ]);
+}
+
+// ===== parsed cache =====
+const parsedCache = new Map();
+async function getParsedCached(pubkey){
+  if (parsedCache.has(pubkey)) return parsedCache.get(pubkey);
+  try{ const info = await getParsedAccountInfo(pubkey); parsedCache.set(pubkey,info); return info; }
+  catch{ parsedCache.set(pubkey,null); return null; }
+}
+async function isMintAccount(pubkey){
+  const info = await getParsedCached(pubkey);
+  const d = info?.value?.data?.parsed;
+  return d?.type === "mint" ? d : null;
+}
+async function tokenAccountInfo(pubkey){
+  const info = await getParsedCached(pubkey);
+  const d = info?.value?.data?.parsed;
+  return d?.type === "account" ? d?.info : null;
+}
+
+// ===== Dexscreener =====
+async function fetchDexscreenerByToken(mint){
+  try{
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { headers:{accept:"application/json"} });
+    if (!r.ok) { dbg("dexs HTTP", r.status); return null; }
+    const j = await r.json();
+    const pairs = Array.isArray(j?.pairs) ? j.pairs : [];
+    if (!pairs.length) return null;
+    // prefer Raydium + nagy likvid
+    pairs.sort((a,b)=>{
+      const ra = (a?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
+      const rb = (b?.dexId||"").toLowerCase()==="raydium" ? 0 : 1;
+      if (ra!==rb) return ra-rb;
+      return (b?.liquidity?.usd||0) - (a?.liquidity?.usd||0);
+    });
+    const p = pairs[0];
+    return {
+      name:   p?.baseToken?.name   || null,
+      symbol: p?.baseToken?.symbol || null,
+      price:  p?.priceUsd ? Number(p.priceUsd) : null,
+      liq:    p?.liquidity?.usd ? Number(p.liquidity.usd) : null,
+      fdv:    p?.fdv ? Number(p.fdv) : null,
+      mcap:   p?.marketCap ? Number(p.marketCap) : null,
+      url:    p?.url || null,
+      createdAt: p?.pairCreatedAt || null
+    };
+  }catch(e){ dbg("dexs err:", e.message); return null; }
+}
+
+// ===== Metaplex metadata (opcionális státusz) =====
+async function fetchMetaplexMetadata(mint) {
+  try {
+    const accs = await getProgramAccounts(METAPLEX_META, [{ memcmp: { offset: 1 + 32, bytes: mint } }]);
+    if (!Array.isArray(accs) || accs.length === 0) return null;
+    const dataB64 = accs[0]?.account?.data?.[0];
+    if (!dataB64) return null;
+    const buf = Buffer.from(dataB64, "base64");
+    let o = 0;
+    const readU8  = () => buf[o++];
+    const readU16 = () => { const v = buf.readUInt16LE(o); o+=2; return v; };
+    const readU32 = () => { const v = buf.readUInt32LE(o); o+=4; return v; };
+    const readStr = () => { const len = readU32(); const s = buf.slice(o, o+len).toString("utf8"); o += len; return s; };
+    const skipPk = () => { o += 32; };
+    readU8(); skipPk(); skipPk(); // key + updateAuth + mint
+    const name   = readStr().trim();
+    const symbol = readStr().trim();
+    readStr(); readU16();
+    const hasCreators = readU8();
+    if (hasCreators === 1) { const n = readU32(); for (let i=0;i<n;i++){ skipPk(); readU8(); readU8(); } }
+    readU8();
+    const isMutable = !!readU8();
+    return { name, symbol, isMutable };
+  } catch { return null; }
+}
+
+// ===== Base58 util (state scanhez) =====
+const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function bs58encode(buf){
+  if (!buf || !buf.length) return "";
+  let x = [...buf];
+  let zeros = 0;
+  while (zeros < x.length && x[zeros] === 0) zeros++;
+  const b58 = [];
+  let start = zeros;
+  while (start < x.length) {
+    let carry = 0;
+    for (let i = start; i < x.length; i++) {
+      const v = (x[i] & 0xff) + carry * 256;
+      x[i] = (v / 58) | 0;
+      carry = v % 58;
+    }
+    b58.push(ALPHABET[carry]);
+    while (start < x.length && x[start] === 0) start++;
+  }
+  for (let i = 0; i < zeros; i++) b58.push("1");
+  return b58.reverse().join("");
+}
+
+// ===== Perzisztens dedup =====
+const SENT_FILE = "/tmp/sent_sigs.json";
+const SENT_TTL_MS = 48 * 60 * 60 * 1000; // 48h
+const SENT_MAX = 5000;
+let sentMap = new Map(); // sig -> ts
+
+function loadSent() {
+  try {
+    const raw = fs.readFileSync(SENT_FILE, "utf8");
+    const arr = JSON.parse(raw);
+    const now = Date.now();
+    sentMap = new Map(arr.filter(([sig, ts]) => now - ts < SENT_TTL_MS));
+    log(`sent_sigs loaded: ${sentMap.size}`);
+  } catch { sentMap = new Map(); }
+}
+function saveSent() {
+  try {
+    const entries = [...sentMap.entries()];
+    entries.sort((a,b)=>a[1]-b[1]); // oldest first
+    const trimmed = entries.slice(Math.max(0, entries.length - SENT_MAX));
+    fs.writeFileSync(SENT_FILE, JSON.stringify(trimmed), "utf8");
+  } catch (e) { dbg("saveSent err:", e.message); }
+}
+loadSent();
 
 // ===== Telegram (queue + throttle) =====
-const tgQueue = [];
-let tgSending = false;
-
-async function sendTelegram(text) {
+const tgQ=[]; let tgSending=false;
+async function sendTelegram(text){
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-  tgQueue.push(text);
-  if (tgSending) return;
-  tgSending = true;
-  while (tgQueue.length) {
-    const msg = tgQueue.shift();
-    try {
+  tgQ.push(text); if (tgSending) return; tgSending=true;
+  while (tgQ.length){
+    const msg = tgQ.shift();
+    try{
       const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          text: msg,
-          parse_mode: "HTML",
-          disable_web_page_preview: false
-        })
+        method:"POST", headers:{ "content-type":"application/json" },
+        body: JSON.stringify({ chat_id:TG_CHAT_ID, text:msg, parse_mode:"HTML", disable_web_page_preview:false })
       });
-      if (r.status === 429) {
-        let wait = 2500;
-        try {
-          const jr = await r.json();
-          if (jr?.parameters?.retry_after) wait = (jr.parameters.retry_after * 1000) | 0;
-        } catch {}
-        await new Promise((r) => setTimeout(r, wait));
-        tgQueue.unshift(msg);
+      if (r.status===429){
+        let wait=3000; try{ const jr=await r.json(); if (jr?.parameters?.retry_after) wait=jr.parameters.retry_after*1000; }catch{}
+        await new Promise(res=>setTimeout(res,wait)); tgQ.unshift(msg);
       } else {
-        await new Promise((r) => setTimeout(r, 1100));
+        await new Promise(res=>setTimeout(res,1200));
       }
-    } catch (e) {
-      dbg("TG error:", e.message);
-      await new Promise((r) => setTimeout(r, 2000));
+    }catch(e){ log("TG err:", e.message); await new Promise(res=>setTimeout(res,2000)); }
+  }
+  tgSending=false;
+}
+
+// ===== Rate limiter a getTransaction-hoz =====
+const sigQueue=[]; const seenSig=new Set(); let workerRunning=false;
+async function enqueueSignature(sig){
+  if (seenSig.has(sig)) return; seenSig.add(sig); sigQueue.push(sig);
+  if (!workerRunning){
+    workerRunning=true;
+    while (sigQueue.length){
+      const s = sigQueue.shift();
+      try{ await processSignature(s); }catch(e){ log("processSignature err:", e.message); }
+      await new Promise(r=>setTimeout(r, RATE_MS));
+    }
+    workerRunning=false;
+  }
+}
+
+// ===== Utils =====
+function ago(tsMs){
+  const s = Math.max(1, Math.floor((Date.now()-tsMs)/1000));
+  if (s<60) return `${s}s ago`;
+  const m = Math.floor(s/60); if (m<60) return `${m} minutes ago`;
+  const h = Math.floor(m/60); if (h<24) return `${h} hours ago`;
+  const d = Math.floor(h/24); return `${d} days ago`;
+}
+
+// ===== 1) Balance diff → base/quote jelölt =====
+function resolveMintsByBalanceDiff(tx, lpMint) {
+  const pre = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+  const post = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+
+  const key = (b) => `${b?.accountIndex || 0}|${b?.mint || ""}`;
+  const preMap = new Map(pre.map(b => [key(b), b]));
+  const changes = [];
+  for (const b of post) {
+    const k = key(b);
+    const p = preMap.get(k);
+    const mint = b?.mint;
+    if (!mint || mint === lpMint) continue;
+    const dec = Number(b?.uiTokenAmount?.decimals || 0);
+    const postAmt = Number(b?.uiTokenAmount?.amount || 0);
+    const preAmt  = Number(p?.uiTokenAmount?.amount || 0);
+    const diffRaw = postAmt - preAmt;
+    const diffAbs = Math.abs(diffRaw) / (10 ** dec);
+    if (diffAbs > 0) changes.push({ mint, diffAbs });
+  }
+  const byMint = new Map();
+  for (const c of changes) byMint.set(c.mint, (byMint.get(c.mint) || 0) + c.diffAbs);
+  const ranked = [...byMint.entries()].sort((a,b)=>b[1]-a[1]);
+  if (ranked.length >= 2) {
+    const [m1, m2] = ranked.slice(0,2).map(x=>x[0]);
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint: m2, quoteMint: m1, source: "baldiff" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint: m1, quoteMint: m2, source: "baldiff" };
+    return { baseMint: m1, quoteMint: m2, source: "baldiff" };
+  }
+  return { baseMint: null, quoteMint: null, source: "baldiff-none" };
+}
+
+// ===== 2) Pool state RAW → 32B kulcsok scannelése =====
+async function resolveMintsFromState(rayAccounts, lpMint) {
+  const stateCandidates = [];
+  for (const acc of rayAccounts) {
+    try{
+      const info = await getAccountInfoRaw(acc);
+      const owner = info?.value?.owner;
+      if (owner === RAY_AMM_V4 || owner === RAY_CPMM) {
+        const b64 = info?.value?.data?.[0];
+        if (b64) stateCandidates.push(Buffer.from(b64, "base64"));
+      }
+      if (stateCandidates.length >= 6) break;
+    }catch{}
+  }
+  for (const buf of stateCandidates) {
+    const seen = new Set();
+    const found = [];
+    for (let off = 0; off + 32 <= buf.length; off++) {
+      const pk = bs58encode(buf.slice(off, off + 32));
+      if (seen.has(pk)) continue; seen.add(pk);
+      if (pk.length < 32 || pk.length > 44) continue;
+      if (pk === lpMint) continue;
+      const mintInfo = await isMintAccount(pk);
+      if (mintInfo) {
+        found.push(pk);
+        if (found.length > 4) break;
+      }
+    }
+    const uniq = [...new Set(found)];
+    if (uniq.length === 2) {
+      const [m1, m2] = uniq;
+      if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"state" };
+      if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"state" };
+      return { baseMint:m1, quoteMint:m2, source:"state" };
     }
   }
-  tgSending = false;
+  return { baseMint:null, quoteMint:null, source:"state-none" };
 }
 
-// ===== Signature worker (rate-limit) =====
-const sigQueue = [];
-const seenSig = new Set();
-let workerRunning = false;
-
-async function enqueueSignature(sig, src) {
-  if (!sig || seenSig.has(sig)) return;
-  seenSig.add(sig);
-  sigQueue.push({ sig, src });
-  if (!workerRunning) {
-    workerRunning = true;
-    const delay = Math.max(1000 / RATE_TX_PER_SEC, 250);
-    while (sigQueue.length) {
-      const { sig, src } = sigQueue.shift();
-      await processSignature(sig, src);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-    workerRunning = false;
+// ===== 3) Largest vaults =====
+async function resolveMintsByLargestVaults(rayAccounts, lpMint){
+  const vaults = [];
+  let checked = 0;
+  for (const a of rayAccounts){
+    if (checked++ > 300) break;
+    const ta = await tokenAccountInfo(a);
+    if (!ta) continue;
+    const mint = ta?.mint;
+    if (!mint || mint === lpMint) continue;
+    const amt = Number(ta?.tokenAmount?.amount || 0);
+    vaults.push({ mint, amt });
   }
-}
-
-// ===== Raydium mini-cache =====
-// Map<mint, {ts:number, freq:number}>
-const rayMintCache = new Map();
-
-function cacheBump(addr) {
-  const now = Date.now();
-  const it = rayMintCache.get(addr);
-  if (it) {
-    it.ts = now;
-    it.freq = (it.freq || 0) + 1;
-  } else {
-    rayMintCache.set(addr, { ts: now, freq: 1 });
+  vaults.sort((a,b)=>b.amt - a.amt);
+  const top = vaults.slice(0, 6);
+  const uniqMints = [...new Set(top.map(v=>v.mint))];
+  if (uniqMints.length >= 2){
+    const [m1, m2] = uniqMints.slice(0,2);
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"largest" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"largest" };
+    return { baseMint:m1, quoteMint:m2, source:"largest" };
   }
+  return { baseMint:null, quoteMint:null, source:"largest-none" };
 }
 
-function cachePrune() {
-  const maxAge = CACHE_WINDOW_MIN * 60 * 1000;
-  const now = Date.now();
-  for (const [k, v] of rayMintCache.entries()) {
-    if (now - (v.ts || 0) > maxAge) rayMintCache.delete(k);
+// ===== 4) Fallback: vault mint frekvencia =====
+async function resolveMintsFallback(rayAccounts, lpMint){
+  const freq = new Map();
+  let checked = 0;
+  for (const a of rayAccounts){
+    if (checked++ > 300) break;
+    const ta = await tokenAccountInfo(a);
+    const m = ta?.mint;
+    if (m && m !== lpMint) freq.set(m, (freq.get(m)||0) + 1);
   }
+  const sorted = [...freq.entries()].sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
+  if (sorted.length >= 2){
+    const [m1,m2] = sorted.slice(0,2);
+    if (QUOTE_MINTS.has(m1) && !QUOTE_MINTS.has(m2)) return { baseMint:m2, quoteMint:m1, source:"freq" };
+    if (QUOTE_MINTS.has(m2) && !QUOTE_MINTS.has(m1)) return { baseMint:m1, quoteMint:m2, source:"freq" };
+    return { baseMint:m1, quoteMint:m2, source:"freq" };
+  }
+  return { baseMint:null, quoteMint:null, source:"freq-none" };
 }
 
-function cacheAccepts(mint) {
-  cachePrune();
-  const it = rayMintCache.get(mint);
-  return !!it && it.freq >= CACHE_MIN_FREQ;
-}
+// ===== Main =====
+async function processSignature(sig){
+  // perzisztens dedup – ha már küldtük, skip
+  if (sentMap.has(sig)) { dbg("skip already sent sig:", sig); return; }
 
-// ===== Core processing =====
-async function processSignature(sig, sourceTag = "") {
   const tx = await getTransaction(sig);
   if (!tx) return;
 
-  const top   = tx?.transaction?.message?.instructions || [];
-  const inner = (tx?.meta?.innerInstructions || []).flatMap((x) => x?.instructions || []);
-  const all   = [...top, ...inner];
+  const top = tx?.transaction?.message?.instructions || [];
+  const inner = (tx?.meta?.innerInstructions || []).flatMap(x=>x?.instructions||[]);
+  const all = [...top, ...inner];
 
-  // 1) Raydium accounts gyűjtése (és cache bump)
+  // --- Raydium accountok összegyűjtése ---
   const rayPrograms = new Set([RAY_AMM_V4, RAY_CPMM]);
   const rayAccounts = new Set();
-  for (const ix of all) {
-    const pid = typeof ix?.programId === "string" ? ix.programId : null;
-    if (pid && rayPrograms.has(pid)) {
-      const accs = (ix?.accounts || [])
-        .map((a) => (typeof a === "string" ? a : (a?.pubkey || a?.toString?.())))
-        .filter(Boolean);
-      for (const a of accs) {
-        rayAccounts.add(a);
-        cacheBump(a);
-      }
+  for (const ix of all){
+    const pid = typeof ix?.programId==="string" ? ix.programId : null;
+    if (pid && rayPrograms.has(pid)){
+      const accs = (ix?.accounts||[]).map(a=>typeof a==="string"?a:(a?.pubkey||a?.toString?.())).filter(Boolean);
+      for (const a of accs) rayAccounts.add(a);
     }
   }
-
-  // 2) Token-burn(ok) keresése
-  const burns = [];
-  for (const ix of all) {
-    const pid = typeof ix?.programId === "string" ? ix.programId : null;
-    if (pid !== TOKENKEG) continue;
-    const type = ix?.parsed?.type?.toLowerCase?.() || ix?.instructionName?.toLowerCase?.();
-    if (type === "burn" || type === "burnchecked") {
-      const info  = ix?.parsed?.info || {};
-      const mint  = info.mint || ix?.mint;
-      const amt   = info.amount || ix?.amount;
-      if (mint) burns.push({ mint, amount: amt });
-    }
+  // a message accountKeys is legyen benne (pár Raydium account csak ott szerepel)
+  const msgKeys = tx?.transaction?.message?.accountKeys || [];
+  for (const k of msgKeys) {
+    const pk = typeof k === "string" ? k : (k?.pubkey || k?.toString?.());
+    if (pk) rayAccounts.add(pk);
   }
+  dbg("rayAccounts count:", rayAccounts.size);
 
-  if (!burns.length) {
-    dbg("skip: no burn in tx", sig.slice(0, 8));
+  // --- Tokenkeg Burn → LP mint (STRICT) ---
+  let lpMint=null, burnAmountRaw=0;
+  for (const ix of all){
+    const pid = typeof ix?.programId==="string" ? ix.programId : null;
+    if (pid!==TOKENKEG) continue;
+    const isBurn = ix?.parsed?.type==="burn" || ix?.instructionName==="Burn";
+    if (!isBurn) continue;
+    const cand = ix?.parsed?.info?.mint || ix?.mint;
+    if (!cand) continue;
+
+    // STRICT: a burn-ölt mintnek Raydium accountokban kell szerepelnie
+    if (!rayAccounts.has(cand)) { dbg("skip burn: mint not in Raydium accounts", cand); continue; }
+
+    lpMint = cand;
+    burnAmountRaw = Number(ix?.parsed?.info?.amount || ix?.amount || 0);
+    break;
+  }
+  if (!lpMint){ dbg("no LP mint match (strict)"); return; }
+
+  // --- LP supply + burn% ---
+  let lpSupplyPost=0, lpDecimals=0;
+  try{
+    const mi = await getParsedCached(lpMint);
+    const d = mi?.value?.data?.parsed?.info;
+    if (d?.supply) lpSupplyPost = Number(d.supply);
+    if (d?.decimals!=null) lpDecimals = Number(d.decimals)||0;
+  }catch{}
+  const lpSupplyPre = lpSupplyPost + burnAmountRaw;
+  const burnShare = lpSupplyPre>0 ? (burnAmountRaw/lpSupplyPre) : 0;
+
+  if (burnShare < MIN_LP_BURN_PCT){
+    dbg(`skip: burnShare ${(burnShare*100).toFixed(2)}% < min ${(MIN_LP_BURN_PCT*100).toFixed(2)}%`);
     return;
   }
 
-  // 3) Döntés: same-tx LP → ok; különben cache alapján
-  for (const b of burns) {
-    const { mint, amount } = b;
-
-    if (rayAccounts.has(mint)) {
-      await announce(sig, mint, amount, tx, "same-tx");
-      return;
-    }
-
-    if (STRICT_LP_MATCH) {
-      dbg("no LP mint match (strict)", mint);
-      continue;
-    }
-
-    if (cacheAccepts(mint)) {
-      await announce(sig, mint, amount, tx, "cache");
-      return;
-    } else {
-      dbg("skip: mint has no recent Raydium footprint", mint);
+  // --- becsült SOL a poolból (WSOL vault) ---
+  let wsolVaultRaw=0, wsolDecimals=9; let checked=0;
+  for (const a of rayAccounts){
+    if (checked++>120) break;
+    const acc = await tokenAccountInfo(a);
+    if (acc?.mint===WSOL_MINT){
+      const ta = acc?.tokenAmount;
+      if (ta?.amount) wsolVaultRaw = Number(ta.amount);
+      if (ta?.decimals!=null) wsolDecimals = Number(ta.decimals)||9;
+      break;
     }
   }
+  const estSolOut = burnShare * (wsolVaultRaw/Math.pow(10,wsolDecimals));
+  if (MIN_SOL_BURN>0 && estSolOut < MIN_SOL_BURN){
+    log(`skip (est SOL ${estSolOut.toFixed(4)} < min ${MIN_SOL_BURN}) sig=${sig}`);
+    return;
+  }
+
+  // --- Base/Quote mints feloldás (4 lépcső) – csak a base kell a tokenhez
+  let res = resolveMintsByBalanceDiff(tx, lpMint);
+  if (!res.baseMint){ const r1 = await resolveMintsFromState(rayAccounts, lpMint); if (r1.baseMint) res = r1; }
+  if (!res.baseMint){ const r2 = await resolveMintsByLargestVaults(rayAccounts, lpMint); if (r2.baseMint) res = r2; }
+  if (!res.baseMint){ const r3 = await resolveMintsFallback(rayAccounts, lpMint); if (r3.baseMint) res = r3; }
+  const { baseMint } = res;
+
+  // Dexscreener a base minthez (név/ár/mcap/liq + url + createdAt)
+  let dx=null; if (baseMint) dx = await fetchDexscreenerByToken(baseMint);
+
+  // --- Max token age szűrő ---
+  if (MAX_TOKEN_AGE_MIN > 0) {
+    const createdAt = dx?.createdAt ? Number(dx.createdAt) : null;
+    if (!createdAt) { dbg("skip: no pairCreatedAt (age unknown)"); return; }
+    const ageMin = (Date.now() - createdAt) / 60000;
+    if (ageMin > MAX_TOKEN_AGE_MIN) {
+      dbg(`skip: token age ${ageMin.toFixed(1)}min > max ${MAX_TOKEN_AGE_MIN}min`);
+      return;
+    }
+  }
+
+  // --- opcionális security flag-ek (csak státuszhoz) ---
+  let mintAuthNone=null, freezeNone=null, metaMutable=null;
+  if (baseMint){
+    try{
+      const mi = await getParsedCached(baseMint);
+      const info = mi?.value?.data?.parsed?.info;
+      mintAuthNone = (info?.mintAuthority===null || info?.mintAuthority===undefined);
+      freezeNone   = (info?.freezeAuthority===null || info?.freezeAuthority===undefined);
+    }catch{}
+    const md = await fetchMetaplexMetadata(baseMint);
+    if (md){ metaMutable = md.isMutable; }
+  }
+
+  // --- Üzenet (csak Token Mint) ---
+  const link = `https://solscan.io/tx/${sig}`;
+  const burnPct = (burnShare*100).toFixed(2);
+  const burnAgo = tx?.blockTime ? ago(tx.blockTime*1000) : "n/a";
+  const headTitle = (dx?.name && dx?.symbol) ? `${dx.name} (${dx.symbol})` : "Raydium LP Burn";
+  const mcapStr = dx?.mcap!=null ? `$${dx.mcap.toLocaleString()}` : (dx?.fdv!=null?`$${dx.fdv.toLocaleString()}`:"n/a");
+  const liqStr  = dx?.liq!=null  ? `$${dx.liq.toLocaleString()}` : "n/a";
+  const priceStr= dx?.price!=null? `$${dx.price}` : "n/a";
+
+  const lines = [
+    `Solana LP Burns`,
+    `<b>${headTitle}</b>`,
+    "",
+    `🔥 <b>Burn Percentage:</b> ${burnPct}%`,
+    `🕒 <b>Burn Time:</b> ${burnAgo}`,
+    "",
+    `📊 <b>Marketcap:</b> ${mcapStr}`,
+    `💧 <b>Liquidity:</b> ${liqStr}`,
+    `💲 <b>Price:</b> ${priceStr}`,
+    "",
+    baseMint ? `🧾 <b>Token Mint:</b> <code>${baseMint}</code>` : `🧾 <b>Token Mint:</b> n/a`,
+    "",
+    `⚙️ <b>Security:</b>`,
+    `├ Mutable Metadata: ${metaMutable===null ? "n/a" : (metaMutable ? "Yes ❌" : "No ✅")}`,
+    `├ Mint Authority: ${mintAuthNone===null ? "n/a" : (mintAuthNone ? "No ✅" : "Yes ❌")}`,
+    `└ Freeze Authority: ${freezeNone===null ? "n/a" : (freezeNone ? "No ✅" : "Yes ❌")}`,
+    "",
+    dx?.url ? dx.url : null,
+    `🔗 <a href="${link}">Solscan</a>`,
+    DEBUG ? `\n<code>strict=1</code>` : null
+  ].filter(Boolean);
+
+  // dedup: már most feljegyezzük
+  sentMap.set(sig, Date.now());
+  saveSent();
+
+  await sendTelegram(lines.join("\n"));
+  log(`TG → ${headTitle} | burn=${burnPct}% | sig=${sig}`);
 }
 
-async function announce(sig, mint, amountRaw, tx, how) {
-  const when = tx?.blockTime ? new Date(tx.blockTime * 1000).toISOString() : "";
-  const solscan = `https://solscan.io/tx/${sig}`;
-
-  const title = "Solana LP Burns\nRaydium LP Burn";
-  const msg = [
-    `<b>${title}</b>`,
-    `🔥 Burn Percentage: 100.00%`,
-    `🕒 Burn Time: ${when || "n/a"}`,
-    `📄 Token Mint: <code>${mint}</code>`,
-    amountRaw ? `🔥 Amount (raw): ${amountRaw}` : null,
-    ``,
-    `🔗 <a href="${solscan}">Solscan</a>`,
-    how ? `<i>source: ${how}</i>` : null
-  ].filter(Boolean).join("\n");
-
-  log(`[ALERT] ${how} | mint=${mint} | sig=${sig}`);
-  await sendTelegram(msg);
-}
-
-// ===== WebSocket (Helius) — subscription-ID routing =====
+// ===== WS =====
 let ws;
-let rid = 2000;                                  // request id számláló
-const pending = {};                              // reqId -> label
-const subs    = { rayAmm: null, rayCpmm: null, token: null };  // label -> subId
-
-function wsSend(obj) {
-  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+function wsSend(obj){ if (ws && ws.readyState===ws.OPEN) ws.send(JSON.stringify(obj)); }
+function subscribeLogs(programId, id){
+  wsSend({ jsonrpc:"2.0", id, method:"logsSubscribe", params:[ { mentions:[programId] }, { commitment:"confirmed" } ] });
 }
-
-function subscribeLogs(programId, label) {
-  const id = ++rid;
-  pending[id] = label;
-  wsSend({
-    jsonrpc: "2.0",
-    id,
-    method: "logsSubscribe",
-    params: [{ mentions: [programId] }, { commitment: "confirmed" }]
-  });
-  dbg(`subscribe sent: ${label} -> reqId ${id}`);
-}
-
-function labelBySubId(subId) {
-  for (const [k, v] of Object.entries(subs)) if (v === subId) return k;
-  return null;
-}
-
-function connectWS() {
+function connectWS(){
   log("WS connecting", RPC_WSS);
   ws = new WebSocket(RPC_WSS);
-
-  ws.onopen = () => {
-    log("WS open");
-    // Feliratkozások — a válaszban kapunk subscription ID-t
-    subscribeLogs(RAY_AMM_V4, "rayAmm");
-    subscribeLogs(RAY_CPMM,   "rayCpmm");
-    subscribeLogs(TOKENKEG,   "token");
-  };
-
-  ws.onmessage = async (ev) => {
-    try {
+  ws.onopen = () => { log("WS open"); subscribeLogs(RAY_AMM_V4,1001); subscribeLogs(RAY_CPMM,1002); };
+  ws.onmessage = async (ev)=>{
+    try{
       const data = JSON.parse(ev.data.toString());
-
-      // 1) Feliratkozás-ACK: { id: <reqId>, result: <subscriptionId> }
-      if (data?.id && data?.result && pending[data.id]) {
-        const label = pending[data.id];
-        subs[label] = data.result;
-        delete pending[data.id];
-        dbg(`sub ack: ${label} -> subId ${subs[label]}`);
-        return;
-      }
-
-      // 2) Esemény: { method: "logsNotification", params: { subscription, result } }
-      if (data?.method === "logsNotification") {
-        const subId = data?.params?.subscription;
-        const label = labelBySubId(subId);
-        const res   = data?.params?.result;
-        if (!label || !res) return;
-
-        const sig     = res?.value?.signature;
-        const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
-        if (!sig || logsArr.length === 0) return;
-
-        if (label === "token") {
-          // Csak Burn / BurnChecked logokra
-          const hasBurnLog = logsArr.some((l) => /Instruction:\s*Burn(?:Checked)?/i.test(l));
-          if (hasBurnLog) {
-            dbg(`token burn log -> enqueue ${sig.slice(0, 8)}`);
-            return enqueueSignature(sig, "token-burn-log");
-          }
-          return;
-        }
-
-        if (label === "rayAmm" || label === "rayCpmm") {
-          // Raydium csatornáról minden tx mehet a feldolgozásra (cache-hez is kell)
-          dbg(`ray stream -> enqueue ${sig.slice(0, 8)}`);
-          return enqueueSignature(sig, "ray-stream");
-        }
-      }
-    } catch (e) {
-      dbg("WS msg err:", e.message);
-    }
+      const res = data?.params?.result;
+      const sig = res?.value?.signature;
+      const logsArr = Array.isArray(res?.value?.logs) ? res.value.logs : [];
+      if (!sig || logsArr.length===0) return;
+      // csak akkor, ha tényleg szerepel: "Instruction: Burn"
+      const hasBurnLog = logsArr.some(l => typeof l==="string" && /Instruction:\s*Burn\b/i.test(l));
+      if (!hasBurnLog) return;
+      await enqueueSignature(sig);
+    }catch(e){ log("WS msg err:", e.message); }
   };
-
-  ws.onclose = () => {
-    log("WS closed, reconnecting in 3s…");
-    setTimeout(connectWS, 3000);
-  };
-
-  ws.onerror = (e) => {
-    dbg("WS error:", e?.message || String(e));
-  };
+  ws.onclose = ()=>{ log("WS closed, reconnect in 3s…"); setTimeout(connectWS,3000); };
+  ws.onerror = (e)=>{ log("WS error:", e?.message || String(e)); };
 }
-
 connectWS();
