@@ -322,13 +322,19 @@ async function processSignature(sig){
   // Dexscreener (kártya)
   let dx=null; if(baseMint) dx=await fetchDexscreenerByToken(baseMint);
 
-  // Max token age (opcionális)
-  if(MAX_TOKEN_AGE_MIN>0){
-    const createdAt = dx?.createdAt ? Number(dx.createdAt) : null;
-    if(!createdAt){ dbg("skip: no pairCreatedAt (age unknown)"); return; }
-    const ageMin = (Date.now()-createdAt)/60000;
-    if(ageMin > MAX_TOKEN_AGE_MIN){ dbg(`skip: age ${ageMin.toFixed(1)}min > ${MAX_TOKEN_AGE_MIN}min`); return; }
+// Max token age (opcionális)
+if (MAX_TOKEN_AGE_MIN > 0) {
+  const createdAt = dx?.createdAt ? Number(dx.createdAt) : null;
+  if (createdAt) {
+    const ageMin = (Date.now() - createdAt) / 60000;
+    if (ageMin > MAX_TOKEN_AGE_MIN) {
+      dbg(`skip: age ${ageMin.toFixed(1)}min > ${MAX_TOKEN_AGE_MIN}min`);
+      return;
+    }
+  } else {
+    dbg("no pairCreatedAt → treating as fresh (pass)");
   }
+}
 
   // Security flags
   let mintAuthNone=null, freezeNone=null, metaMutable=null;
